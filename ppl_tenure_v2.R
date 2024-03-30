@@ -2,8 +2,10 @@
 # setwd("/Users/davidvandijcke/Dropbox (University of Michigan)/Flo_GSRA/repo/DiSCos")
 # devtools::load_all()
 
+#----------------------------
+### Load full data ####
+#----------------------------
 
-### Load data ####
 conf <- list()
 Sys.setenv("SPARK_MEM" = "70g")
 conf$`sparklyr.shell.driver-memory` <- "50G"
@@ -24,96 +26,129 @@ sparkdf <- spark_read_parquet(sc, name = "people_tenure_prepped",
 sparkdf <- sparkdf %>% mutate(RTO_date_manual = ifelse(COMPANY_NAME == "amazon", "May 1 2023", RTO_date_manual))
 sparkdf <- sparkdf %>% mutate(naics_code = ifelse(COMPANY_NAME == "microsoft", 54151, naics_code))
 
-# sparkdf <- sparkdf %>% mutate(RTO_date_manual = ifelse(COMPANY_NAME == "apple", "Apr 11 2022", RTO_date_manual))
+sparkdf <- sparkdf %>% mutate(RTO_date_manual = ifelse(COMPANY_NAME == "apple", "Apr 11 2022", RTO_date_manual))
 
 sparkdf <- sparkdf %>% mutate(naics_2 = substr(naics_code, 1, 2))
 sparkdf <- sparkdf %>% filter(naics_2 %in% c("51", "54", "33"))
 
-## filter out layoffs
-layoffs <- fread(file.path(dataOut, 'layoffs_matched_manual_v2.csv'))
-layoffs <- layoffs %>% select(V1, Date)
+# retrieve list of large companies that implement RTO
+comp_list <-  sparkdf %>% filter((RTO_date_manual != "never") & (!is.na(RTO_date_manual))) %>%
+  select("COMPANY_NAME") %>% distinct() %>% collect()
 
-rtocomp <- "microsoft"
 
-rtodate <- sparkdf %>% filter(COMPANY_NAME == rtocomp) %>% select(RTO_date_manual) %>%
-  distinct() %>% collect()
-layoffcomp <- layoffs[V1 == rtocomp]
 
-rtodate <- as.Date(rtodate$RTO_date_manual[1], format="%b %d %Y")
+#----------------------------
+### Create Analysis Ready Datasets for Each Company ####
+#----------------------------
 
-# assign startDate as 6 months before rtodate and endDate as 6 months after
-firstDateOfMonth <- floor_date(rtodate, "month")
-startDate <- firstDateOfMonth %m-% months(8)
-endDate <- firstDateOfMonth %m+% months(6)
+redo_data_parsing <- FALSE
 
-if (nrow(layoffcomp) > 0) {
-  # if there are layoffs in this time window, restrict the sample period further
-  layoffs_sub <- layoffcomp[as.Date(Date) %between% c(startDate, endDate)]
-  # layoffs_sub <- layoffs[V1 == "netflix"][as.Date(Date) %between% c(startDate, endDate)]
-  layoffs_sub <- layoffs_sub[, Date := floor_date(Date, "month")]
-  if (nrow(layoffs_sub) > 0) {
-    layoffs_sub[, startDiff := as.numeric(difftime(Date, firstDateOfMonth, units="days"))]
-    if (any(layoffs_sub$startDiff %between% c(-70,50))) stop("Problematic layoffs in sample period") # skip this company if not at least 2 months
-    if (!all(layoffs_sub$startDiff >= 0)) {
-      startDate <- layoffs_sub[startDiff == max(layoffs_sub[startDiff < 0]$startDiff)]$Date %m+% months(1)
+if (redo_data_parsing) {
+  ## filter out layoffs
+  layoffs <- fread(file.path(dataOut, 'layoffs_matched_manual_v2.csv'))
+  layoffs <- layoffs %>% select(V1, Date)
+
+  ## loop over all RTO companies and save their prepped datasets
+  for (rtocomp in c("microsoft", "spacex", "apple")) { # all other companies have layoffs within sample period
+
+    rtodate <- sparkdf %>% filter(COMPANY_NAME == rtocomp) %>% select(RTO_date_manual) %>%
+      distinct() %>% collect()
+    layoffcomp <- layoffs[V1 == rtocomp]
+
+    rtodate <- as.Date(rtodate$RTO_date_manual[1], format="%b %d %Y")
+
+    # assign startDate as 6 months before rtodate and endDate as 6 months after
+    firstDateOfMonth <- floor_date(rtodate, "month")
+    startDate <- firstDateOfMonth %m-% months(8)
+    endDate <- firstDateOfMonth %m+% months(6)
+
+    if (nrow(layoffcomp) > 0) {
+      # if there are layoffs in this time window, restrict the sample period further
+      layoffs_sub <- layoffcomp[as.Date(Date) %between% c(startDate, endDate)]
+      # layoffs_sub <- layoffs[V1 == "netflix"][as.Date(Date) %between% c(startDate, endDate)]
+      layoffs_sub <- layoffs_sub[, Date := floor_date(Date, "month")]
+      if (nrow(layoffs_sub) > 0) {
+        layoffs_sub[, startDiff := as.numeric(difftime(Date, firstDateOfMonth, units="days"))]
+        if (any(layoffs_sub$startDiff %between% c(-70,50))) {
+          print("Problematic layoffs in sample period")
+          next
+        }# skip this company if not at least 2 months
+        if (!all(layoffs_sub$startDiff >= 0)) {
+          startDate <- layoffs_sub[startDiff == max(layoffs_sub[startDiff < 0]$startDiff)]$Date %m+% months(1)
+        }
+        if (!all(layoffs_sub$startDiff < 0)) {
+          endDate <- layoffs_sub[startDiff == min(layoffs_sub[startDiff > 0]$startDiff)]$Date %m-% months(1)
+        }
+      }
     }
-    if (!all(layoffs_sub$startDiff < 0)) {
-      endDate <- layoffs_sub[startDiff == min(layoffs_sub[startDiff > 0]$startDiff)]$Date %m-% months(1)
-    }
+
+    # now get companies with a layoff in that period
+    layoffs_filter <- unique(layoffs[Date %between% c(startDate, endDate)]$V1)
+
+    sparkout <- sparkdf %>% filter(!COMPANY_NAME %in% layoffs_filter)
+
+    sparkout <- sparkout %>% filter((month >= startDate) & (month <= endDate))
+
+
+    # naics <- sparkdf %>% filter(COMPANY_NAME == "apple") %>% select(NAICS) %>% distinct()
+
+    # sparkdf <- sparkdf %>% filter(COMPANY_INDUSTRY == "computer software")
+
+    sparkout <- sparkout %>% select(ID, id_col, month, time_col, tenure, edu_days, START_DATE, END_DATE,
+                                    title_categorical, COMPANY_NAME, RTO_date_manual, naics_code, gender)
+
+    # filter companies with at least 5% of RTO company's workforce
+    temp <- sparkout %>%
+      group_by(time_col, COMPANY_NAME) %>% summarise(nobs = n()) %>%
+      group_by(COMPANY_NAME) %>% summarise(nobs = min(nobs)) %>% collect() %>% setDT()
+
+
+    ids <- temp[nobs > 0.05 * temp[COMPANY_NAME==rtocomp]$nobs]$COMPANY_NAME
+
+    # if (length(ids) < 20) next
+
+    sparkout <- sparkout %>% filter(COMPANY_NAME %in% ids)
+
+
+    ppl <- collect(sparkout)
+
+    fwrite(ppl, file.path(dataOut, paste0('disco_prepped_', rtocomp, '.csv.gz')))
+
   }
+
 }
 
-# now get companies with a layoff in that period
-layoffs_filter <- unique(layoffs[Date %between% c(startDate, endDate)]$V1)
-
-sparkdf <- sparkdf %>% filter(!COMPANY_NAME %in% layoffs_filter)
-
-sparkdf <- sparkdf %>% filter((month >= startDate) & (month <= endDate))
-
-
-# naics <- sparkdf %>% filter(COMPANY_NAME == "apple") %>% select(NAICS) %>% distinct()
-
-# sparkdf <- sparkdf %>% filter(COMPANY_INDUSTRY == "computer software")
-
-sparkdf <- sparkdf %>% select(ID, id_col, month, time_col, tenure, edu_days, START_DATE, END_DATE,
-                              title_categorical, COMPANY_NAME, RTO_date_manual, naics_code)
-
-# filter companies with at least 5% of RTO company's workforce
-temp <- sparkdf %>%
-  group_by(time_col, COMPANY_NAME) %>% summarise(nobs = n()) %>%
-  group_by(COMPANY_NAME) %>% summarise(nobs = min(nobs)) %>% collect() %>% setDT()
-
-
-ids <- temp[nobs > 0.02 * temp[COMPANY_NAME==rtocomp]$nobs]$COMPANY_NAME
-
-# if (length(ids) < 20) next
-
-sparkdf <- sparkdf %>% filter(COMPANY_NAME %in% ids)
-
-
-ppl <- collect(sparkdf)
-
-fwrite(ppl, file.path(dataOut, 'disco_prepped_microsoft.csv.gz'))
-
+#----------------------------
+### Company-by-company analysis ####
+#----------------------------
 
 
 #----------------
-# MICROSOFT
+# MICROSOFT !!! TODO: filter out SpaceX!!!
 #----------------
 
 
 # TENURE
 #--------------
 
+rtocomp <- "microsoft"
+
+
 ppl <- fread(file.path(dataOut, 'disco_prepped_microsoft.csv.gz'))
 ppl <- as.data.table(ppl)
+
+rtodate <- ppl %>% filter(COMPANY_NAME == rtocomp) %>% select(RTO_date_manual) %>%
+  distinct()
+rtodate <- as.Date(rtodate$RTO_date_manual[1], format="%b %d %Y")
+
+# assign startDate as 6 months before rtodate and endDate as 6 months after
+firstDateOfMonth <- floor_date(rtodate, "month")
+startDate <- firstDateOfMonth %m-% months(6)
+endDate <- firstDateOfMonth %m+% months(3)
 
 
 ppl <- ppl[, date := as.Date(RTO_date_manual, format = "%b %d %Y")]
 ppl <- ppl[date >= endDate | is.na(date) | COMPANY_NAME == rtocomp]
-
-
-ppl[, y_col := tenure]
 
 
 ppl <- ppl[, nobs_time := .N, by = c("id_col", "time_col")]
@@ -127,237 +162,159 @@ t0 <- unique(test[month == firstDateOfMonth]$time_col)
 #-----
 # try grouping by 4 months before and after
 grouped <- test
-grouped <- grouped[time_col %between% c(t0-8,t0+3)]
-grouped[,time_col := findInterval(time_col, c(t0-8, t0-4, t0, t0+3))]
-grouped <- grouped %>% group_by(time_col, ID, id_col) %>% summarize(y_col = max(y_col))
-
-# grouped <- grouped[(grouped$y_col > 0) & !is.na(grouped$y_col) ,]
-t0 <- 3
-
-M <- 2000 #  max(list(uniqueN(ppl$id_col) * 1.5, 1000))
-#-----
-
-disco <- DiSCos::DiSCo(grouped, id_col.target = id_col.target, t0 = t0, q_max=0.9, G = 100, M=M, num.cores = 20,
-                       permutation = TRUE, CI = FALSE, boots = 1000, simplex=TRUE, seed=5, qmethod=NULL)
-summary(disco$perm)
-discot <-  DiSCoTEA(disco,agg="quantileDiff", graph=TRUE)
-
-
-# TITLES
-#------------
-
-
-ppl <- fread(file.path(dataOut, 'disco_prepped_microsoft.csv.gz'))
-ppl <- as.data.table(ppl)
-
-
-ppl <- ppl[, date := as.Date(RTO_date_manual, format = "%b %d %Y")]
-ppl <- ppl[date >= endDate | is.na(date) | COMPANY_NAME == rtocomp]
-
-ppl[, y_col := title_categorical]
-
-ppl <- ppl[, nobs_time := .N, by = c("id_col", "time_col")]
-ppl <- ppl[, nobs := min(nobs_time), by = "id_col"]
-
-test <- ppl
-
-id_col.target <- unique(test[COMPANY_NAME == rtocomp]$id_col)
-t0 <- unique(test[month == firstDateOfMonth]$time_col)
-
-#-----
-# try grouping by 4 months before and after
-grouped <- test
-grouped <- grouped[time_col %between% c(t0-8,t0+3)]
-grouped[,time_col := findInterval(time_col, c(t0-8, t0-4, t0, t0+3))]
-grouped <- grouped %>% group_by(time_col, ID, id_col) %>% summarize(y_col = max(y_col))
-
-# grouped <- grouped[(grouped$y_col > 0) & !is.na(grouped$y_col) ,]
-t0 <- 3
-
-M <- 2000 #  max(list(uniqueN(ppl$id_col) * 1.5, 1000))
-#-----
-
-disco <- DiSCos::DiSCo(grouped, id_col.target = id_col.target, t0 = t0, q_max=0.9, G = 1000, M=M, num.cores = 20,
-                       permutation = FALSE, CI = FALSE, boots = 1000, simplex=TRUE, seed=5, qmethod=NULL)
-summary(disco$perm)
-discot <-  DiSCoTEA(disco,agg="quantile", graph=TRUE)
-
-
-
-
-
-printWeights <- function(disco) {
-  # print weights
-  df <- data.table(weights = disco$Weights_DiSCo_avg, id_col = disco$control_ids)
-  temp <- unique(ppl, by=c("id_col", "COMPANY_NAME"))
-  df <- df[temp[,c("id_col", "COMPANY_NAME")], on = "id_col"]
-
-  # sort by weights
-  df <- df[order(weights, decreasing = TRUE)]
-  return(df)
-}
-
-
-
-prettyPlot <- s
-
-# plot nicer figure
-# reconstruct some parameters
-df <- disco$params$df
-t_max <- max(df$time_col)
-t_min <- min(df$time_col)
-t0 <- disco$params$t0
-T0 <- unique(df[time_col == t0]$time_col)  - t_min
-T_max <- max(df$time_col) - t_min + 1
-CI <- disco$params$CI
-cl <- disco$params$cl
-evgrid = seq(from=0,to=1,length.out=disco$params$G+1)
-qmethod <- disco$params$qmethod
-q_min <- disco$params$q_min
-q_max <- disco$params$q_max
-
-t_start <- t_min
-T_start <- 1
-
-cdf_centered = discot$treats
-grid_cdf <- discot$grid
-ci_lower <- discot$ci_lower
-ci_upper <- discot$ci_upper
-ylim <- c(-200,100)
-xlim <- NULL
-cdf=FALSE
-xlab <- "Quantile"
-ylab="Change in Tenure (Days)"
-obsLine = NULL
-savePlots=FALSE
-plotName=NULL
-lty=1
-lty_obs=1
-t_plot = NULL
-
-# Create a data frame for all data points
-t_list <- rep(t_start:t_max, each = length(grid_cdf))
-
-# instead of t_list, start at june 2022 and create list of months until may 2023
-t_list <- seq(as.Date("2022-01-01"), as.Date("2022-12-01"), by = "month")
-# format as "Jan 2022" and add "(Start of Return to Office)" to September 2022
-t_list <- format(t_list, "%b %Y")
-t_list[4] <- paste0("<span style='color:red;'>", t_list[4], " (Start of Return to Office)", "</span>")
-
-df <- data.frame(time = rep(t_list, each = length(grid_cdf)),
-                 x = rep(grid_cdf, times = length(cdf_centered)),
-                 y = unlist(cdf_centered),
-                 ci_lower = if (CI) unlist(ci_lower) else NA,
-                 ci_upper = if (CI) unlist(ci_upper) else NA,
-                 obsLine = if (!is.null(obsLine)) unlist(obsLine) else NA)
-df$time <- factor(df$time, levels = t_list)
-
-if (!is.null(t_plot)) df <- df[df$time %in% t_plot,]
-
-# Create a ggplot
-p <- ggplot(df, aes(x = x)) +
-  geom_line(aes(y = y), colour = "dodgerblue3", linetype = lty)
-
-if (!is.null(obsLine)) p <- p + geom_line(aes(y = obsLine), colour = "dodgerblue3", linetype = lty_obs, show.legend = !is.null(obsLine))
-
-p <- p +
-  geom_hline(yintercept = 0, colour = "red") +
-  labs(title = "", x = xlab, y = ylab) +
-  theme_minimal() +
-  coord_cartesian(xlim = xlim, ylim = ylim)
-# # turn grid off
-# theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
-#       panel.background = element_blank(), axis.line = element_line(colour = "black"))
-
-clr <- "lightblue"
-if (CI) p <- p + geom_line(aes(y = ci_lower), colour = clr, linetype = lty, show.legend = CI) +
-  geom_line(aes(y = ci_upper), colour = clr, linetype = lty, show.legend = CI)
-
-if (cdf) {
-  p <- p + geom_hline(yintercept = 1, colour = "grey")
-}
-
-n_row <- data.table::uniqueN(df$time)
-p <- p + facet_wrap(~time, ncol = 2, nrow = n_row) + theme(strip.text = ggtext::element_markdown())
-
-ggsave(file.path(figs, "microsoft_main_dist.pdf"), p, width = 5, height = 7,  dpi = 300)
-
-
-
-
-
-
-## mixture of distributions
-#-----
-# try grouping by 4 months before and after
-t0 <- unique(test[month == firstDateOfMonth]$time_col)
-grouped <- test
-grouped <- grouped[time_col %between% c(t0-8,t0+3)]
-grouped[,time_col := findInterval(time_col, c(t0-8, t0-4, t0, t0+3))]
-grouped <- grouped %>% group_by(time_col, ID, id_col) %>% summarize(y_col = max(y_col))
+grouped[, y_col := tenure]
+grouped <- grouped[time_col %between% c(t0-6,t0+2)]
+grouped[,time_col := findInterval(time_col, c(t0-6, t0-3, t0, t0+3))]
+grouped <- grouped[, .(y_col = max(y_col), month=min(month)), by=c("time_col", "ID", "id_col")]  # %>% group_by(time_col, ID, id_col) %>% summarize(y_col = max(y_col), month=min(month))
 
 grouped <- grouped[(grouped$y_col > 0) & !is.na(grouped$y_col) ,]
-grouped <- grouped[(grouped$y_col <= 6),] # for tenure only!
 t0 <- 3
 
 M <- 1000 #  max(list(uniqueN(ppl$id_col) * 1.5, 1000))
 #-----
 
-disco <- DiSCo(grouped, id_col.target = id_col.target, t0 = t0, q_max=1,
-               G = 1000, M=M, num.cores = 10,
-               permutation = FALSE, CI = FALSE, boots = 500, simplex=TRUE,
-               seed=5, qmethod=NULL)
+
+## full distribution
+disco <- DiSCos::DiSCo(grouped, id_col.target = id_col.target, t0 = t0, q_min=0, q_max=0.9, G = 25, M=M, num.cores = 20,
+                       permutation = TRUE, CI = TRUE, boots = 1000, simplex=TRUE, seed=31, qmethod=NULL) # seed 5
 summary(disco$perm)
-discot <-  DiSCoTEA(disco,agg="cdfDiff", graph=TRUE)
+discot <-  DiSCoTEA(disco,agg="quantileDiff", graph=TRUE)
+
+## restricted distribution to check permutation test
+disco_part <- DiSCos::DiSCo(grouped, id_col.target = id_col.target, t0 = t0, q_min=0.5, q_max=0.9, G = 25, M=M, num.cores = 20,
+                            permutation = TRUE, CI = FALSE, boots = 1000, simplex=TRUE, seed=31, qmethod=NULL) # seed 5
+summary(disco_part$perm)
 
 
-df <- data.frame(time = numeric(), diff = numeric(), x=numeric())
-
-for (t in seq(1,3)) {
-  grid <- seq(0,6) # disco$results.periods[[t]]$target$grid
-  targetq <- stats::ecdf(disco$results.periods[[t]]$target$quantiles)(grid)
+weightsdf <- printWeights(disco)
+tab <- xtable(weightsdf[1:5], digits=4)
+print.xtable(tab,  include.rownames=FALSE, floating=FALSE,file=file.path(tabs, "weights_microsoft.tex"))
 
 
-  controls <- disco$results.periods[[t]]$controls$quantiles
-  # Estimating the empirical CDFs
-  CDF.control <- apply(controls, 2, stats::ecdf)
-
-  # Evaluating the CDF on the random grid
-  CDF.matrix <- matrix(0,nrow=length(grid), ncol = (ncol(controls)))
-  for (ii in 1:ncol(controls)){
-    CDF.matrix[,(ii)] <- CDF.control[[ii]](grid)
-  }
-
-  mixq <- CDF.matrix %*% disco$Weights_mixture_avg
-  diff <- targetq - mixq
+## plot figure
+ttemp <- unique(grouped$month)
+t_list <- seq(min(ttemp), max(ttemp), by = "quarter")
+p <- prettyPlot(disco, discot, t_list=t_list)
+p
+ggsave(file.path(figs, "microsoft_main_dist.pdf"), p, width = 5, height = 5,  dpi = 300)
 
 
-  mixlist <- data.frame(time = t, diff = diff, target=targetq, control=mixq, x = grid)
-  df <- rbind(df, mixlist)
-}
-df <- setDT(df)
-
-df[, categorical := floor(x)]
-poop <- df[, .(diff = mean(diff)), by = c("time", "categorical")]
-
-ggplot(df, aes(x=x, y=diff)) + geom_line() +
-  #geom_line(aes(x=x, y=control,linetype="dashed")) +
-  facet_wrap(~time, ncol = 1, nrow = 3)
-
-ggplot(df, aes(x=x, y=diff)) + geom_line(aes(x=x, y=target)) +
-  geom_line(aes(x=x, y=control), linetype="dashed") +facet_wrap(~time, ncol = 1, nrow = 3)
 
 
-title_ranking_inverted <- c(
-  CXO = 10,
-  VP = 9,
-  Director = 8,
-  Partner = 7,
-  Owner = 6,
-  Senior = 5,
-  Manager = 4,
-  Entry = 3,
-  Training = 2,
-  Unpaid = 1
+# TITLES
+#--------------
+
+#-----
+# try grouping by 4 months before and after
+t0 <- unique(test[month == firstDateOfMonth]$time_col)
+
+# need to ignore the leavers for this
+grouped <- test
+grouped[, y_col := title_categorical]
+grouped <- grouped[time_col %between% c(t0-6,t0+2)]
+grouped[,time_col := findInterval(time_col, c(t0-6, t0-3, t0, t0+3))]
+grouped <- grouped[, .(y_col = max(y_col), month=min(month)), by=c("time_col", "ID", "id_col")]  # %>% group_by(time_col, ID, id_col) %>% summarize(y_col = max(y_col), month=min(month))
+
+grouped <- grouped[(grouped$y_col > 0) & !is.na(grouped$y_col) ,]
+grouped <- grouped[(grouped$y_col %between% c(1,6)),] # for tenure only!
+t0 <- 3
+
+M <- 2000 #  max(list(uniqueN(ppl$id_col) * 1.5, 1000))
+#-----
+
+# full distribution
+disco <- DiSCo(grouped, id_col.target = id_col.target, t0 = t0,
+               G = 1000, M=M, num.cores = 3, mixture=TRUE, grid.cat = seq(1,6),
+               permutation = TRUE, CI = TRUE, boots = 1000, simplex=TRUE,
+               seed=31, qmethod=NULL)
+summary(disco$perm)
+discot <-  DiSCoTEA(disco,agg="cdfDiff", graph=TRUE, ylim=c(-0.01, 0.01))
+
+
+# restricted distribution to check permutation test
+temp <- grouped[(grouped$y_col %between% c(2,5)),] # for tenure only!
+disco_part <- DiSCo(temp, id_col.target = id_col.target, t0 = t0,
+                    G = 1000, M=M, num.cores = 20, mixture=TRUE, grid.cat = seq(2,5),
+                    permutation = TRUE, CI = FALSE, boots = 1000, simplex=TRUE,
+                    seed=31, qmethod=NULL)
+summary(disco_part$perm)
+
+
+# print weights
+disco$Weights_DiSCo_avg <- as.vector(disco$Weights_mixture_avg)
+weightsdf <- printWeights(disco)
+tab <- xtable(weightsdf[1:5], digits=4)
+print.xtable(tab,  include.rownames=FALSE, floating=FALSE,file=file.path(tabs, "weights_microsoft_titles.tex"))
+
+
+ttemp <- unique(grouped$month)
+t_list <- seq(min(ttemp, na.rm=TRUE), max(ttemp), by = "quarter")
+p <- prettyHist(disco, discot, t_list=t_list, ylim=c(-0.01, 0.01), xlab="Title Level", ylab="Change in CDF")
+p <- p + scale_x_continuous(breaks=seq(1,6))
+ggsave(file.path(figs, "microsoft_title_dist.pdf"), p, width = 6, height = 5,  dpi = 300)
+
+
+
+
+
+
+# MALE VS FEMALE
+#--------------
+
+#-----
+# try grouping by 4 months before and after
+t0 <- unique(test[month == firstDateOfMonth]$time_col)
+
+# need to ignore the leavers for this
+grouped <- test[END_DATE > month %m+% months(1)] # [(END_DATE > month) & (END_DATE <= (month %m+% months(1)))] # leavers
+grouped[, y_col := as.numeric(gender == "female")]
+grouped <- grouped[time_col %between% c(t0-6,t0+2)]
+grouped[,time_col := findInterval(time_col, c(t0-6, t0-3, t0, t0+3))]
+grouped <- grouped[, .(y_col = max(y_col), month=min(month)), by=c("time_col", "ID", "id_col")]  # %>% group_by(time_col, ID, id_col) %>% summarize(y_col = max(y_col), month=min(month))
+
+grouped <- grouped[(grouped$y_col >= 0) & !is.na(grouped$y_col) ,]
+t0 <- 3
+
+M <- 2000 #  max(list(uniqueN(ppl$id_col) * 1.5, 1000))
+#-----
+
+disco <- DiSCo(grouped, id_col.target = id_col.target, t0 = t0,
+               G = 1000, M=M, num.cores = 3, mixture=TRUE, grid.cat = seq(0,1),
+               permutation = TRUE, CI = TRUE, boots = 1000, simplex=TRUE,
+               seed=31, qmethod=NULL)
+summary(disco$perm)
+discot <-  DiSCoTEA(disco,agg="cdfDiff", graph=TRUE, ylim=c(-0.01, 0.01), samples=c(0) # this is needed to avoid error
 )
+
+
+ttemp <- unique(grouped$month)
+t_list <- seq(min(ttemp, na.rm=TRUE), max(ttemp), by = "quarter")
+p <- prettyHist(disco, discot, t_list=t_list, ylim=c(-0.01, 0.01), xlab="Employee Gender",
+                ylab="Change in CDF", factor=TRUE)
+p <- p + scale_x_discrete(labels=c("Male","Female"))
+ggsave(file.path(figs, "microsoft_gender.pdf"), p, width = 5, height = 5,  dpi = 300)
+
+
+
+#----------------
+# Repeat for all other companies
+#----------------
+
+for (comp in c("spacex", "apple")) {
+
+  robustness(comp)
+
+}
+
+# check permutation tests
+mdl <- load(file.path(mods, paste0(rtocomp, "_model_titles.RData")))
+discot <-  DiSCoTEA(disco,agg="cdfDiff", graph=TRUE)
+sign <- (disco$perm$p_overall < 0.1)
+
+ttemp <- unique(grouped$month)
+t_list <- seq(min(ttemp, na.rm=TRUE), max(ttemp), by = "quarter")
+p <- prettyHist(disco, discot, t_list=t_list, ylim=c(-0.01, 0.01), xlab="Title Level", ylab="Change in CDF", ncol=1)
+p <- p + scale_x_continuous(breaks=seq(1,6))
+ggsave(file.path(figs, paste0(rtocomp, "title_dist", sign, ".pdf")), p, width = 4, height = 8,  dpi = 300)
+
 
