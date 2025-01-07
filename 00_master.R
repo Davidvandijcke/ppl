@@ -1,7 +1,9 @@
 #### Prepare paths and package ####
 
-packages_load <- c("data.table", "here", "ggtext", "changepoint", "tidyverse",
-                   "sparklyr", "devtools", "DiSCos", "xtable")
+packages_load <- c("data.table", "here", "ggtext", "tidyverse",
+                   "sparklyr", "devtools", "DiSCos", "xtable", "stargazer", "igraph",
+                   "eaf"
+                   )
 
 
 if (!require("pacman")) install.packages("pacman")
@@ -12,12 +14,14 @@ setwd("/home/dvdijcke/")
 # system("git clone https://github.com/Davidvandijcke/DiSCos")
 setwd("DiSCos") # remove evmix from dependencies cause cant install on fucking server
 devtools::load_all()
-# devtools::install(dependencies=FALSE)
+#devtools::install(dependencies=FALSE)
 #
-#
+
 codeDir <- "/home/dvdijcke/ppl/code/" # here::here()
 
 setwd(codeDir) # sets cd to program directory
+
+source("utils.R")
 
 dir <- "/home/dvdijcke/ppl" # sub("/[^/]+$", "", codeDir)# get main directory
 dataIn <- file.path(dir, "data", "in")
